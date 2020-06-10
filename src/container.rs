@@ -608,20 +608,49 @@ impl Iterator for AttachResponseIter {
                 Some(Err(err))
             };
         }
-        // read body
-        let mut frame_size_raw = &buf[4..];
-        let frame_size = frame_size_raw.read_u32::<BigEndian>().unwrap();
-        let mut frame = vec![0; frame_size as usize];
-        if let Err(io) = self.res.read_exact(&mut frame) {
-            return Some(Err(io));
-        }
-        match buf[0] {
-            0 => Some(Ok(AttachResponseFrame::new(Stdin, frame))),
-            1 => Some(Ok(AttachResponseFrame::new(Stdout, frame))),
-            2 => Some(Ok(AttachResponseFrame::new(Stderr, frame))),
-            n => {
-                error!("unexpected kind of chunk: {}", n);
-                None
+
+        // is the the stream multiplexed? strictly speaking we can't tell, the
+        // only way to know is to check the TTY boolean that was passed when
+        // creating the container, but we don't have that information available
+        // to us. what we _can_ do is check if the 8 byte header is in the
+        // correct format.
+        // From: https://docs.docker.com/engine/api/v1.40/#operation/ContainerAttach
+        //   header := [8]byte{STREAM_TYPE, 0, 0, 0, SIZE1, SIZE2, SIZE3, SIZE4}
+        //   STREAM_TYPE can be:
+        //     0: stdin (is written on stdout)
+        //     1: stdout
+        //     2: stderr
+        // 0, 1 or 2 are not printable ASCII codes so maybe we can assume (this
+        // probably doesn't work for UTF-8...)
+        let mut stream_type_raw = &buf[..4];
+        let stream_type = stream_type_raw.read_u32::<BigEndian>().unwrap();
+        let framed = match stream_type {
+            0x0000..=0x2000 => true,
+            _               => false
+        };
+
+        if framed {
+            // read body
+            let mut frame_size_raw = &buf[4..];
+            let frame_size = frame_size_raw.read_u32::<BigEndian>().unwrap();
+            let mut frame = vec![0; frame_size as usize];
+            if let Err(io) = self.res.read_exact(&mut frame) {
+                return Some(Err(io));
+            }
+            match buf[0] {
+                0 => Some(Ok(AttachResponseFrame::new(Stdin, frame))),
+                1 => Some(Ok(AttachResponseFrame::new(Stdout, frame))),
+                2 => Some(Ok(AttachResponseFrame::new(Stderr, frame))),
+                n => {
+                    error!("unexpected kind of chunk: {}", n);
+                    None
+                }
+            }
+        } else {
+            let mut body = buf.to_vec();
+            match self.res.read_to_end(&mut body) {
+                Err(io) => Some(Err(io)),
+                Ok(_)   => Some(Ok(AttachResponseFrame::new(Stdout, body)))
             }
         }
     }
